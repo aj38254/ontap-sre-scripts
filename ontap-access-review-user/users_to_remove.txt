@@ -1,0 +1,18 @@
+# Users to remove — GCNV quarterly ONTAP access review.
+#
+# One ONTAP account name per line. The ONTAP account name is the GCP TVC SSO,
+# which is NOT the NetApp SSO — both are shown here so the list can be checked
+# against the TACACS roster (Device Access = REMOVE) without a second lookup.
+#
+# ONTAP / TVC SSO   NetApp SSO   Person
+srisaran          # srisaran     Panchangam Srisa Ranga Ramanujam
+kg42345           # kg42345      Kunal Gupta
+aduttagupta       # anirban1     Anirban Dutta Gupta
+alapo             # tobi         Tobi Alapo
+kmrajesh          # rajeshr4     Rajesh KM
+langhauser        # garrettl     Garrett Langhauser
+mnilesh           # nileshm      Nilesh Maheshwari
+pkaushikroy       # pooja9       Pooja KaushikRoy
+priyance          # priyance     Priyance Mandlewala
+rrajanala         # revanthr     Revanth Rajanala
+sobitha           # natsai       Sobitha Natsai
