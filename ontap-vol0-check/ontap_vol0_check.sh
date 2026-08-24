@@ -36,6 +36,7 @@ SSH_USER="${SSH_USER:-admin}"
 GCP_PROJECT="${GCP_PROJECT:-}"
 MODE="${MODE:-auto}"          # auto | login | direct
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+MAX_SECRETS="${MAX_SECRETS:-4}"   # credentials tried per cluster before asking
 MIN_FREE_GB="${MIN_FREE_GB:-20}"
 PRIORITY_REGIONS="${PRIORITY_REGIONS:-us-c1 us-e4 us-w3 na-ne2 us-w4}"
 
@@ -103,6 +104,10 @@ lc()  { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 shq() { printf "'%s'" "$(printf '%s' "${1:-}" | sed "s/'/'\\\\''/g")"; }
 
+SECRET_CACHE="$(mktemp -d 2>/dev/null || printf '/tmp/vol0.%s' "$$")"
+mkdir -p "$SECRET_CACHE"
+trap 'rm -rf "$SECRET_CACHE"' EXIT
+
 usage() {
   cat <<USAGE
 Usage:
@@ -112,6 +117,12 @@ Usage:
   ./ontap_vol0_check.sh <cluster>...     a single stamp
   ./ontap_vol0_check.sh report           rebuild from saved captures, no logins
   ./ontap_vol0_check.sh list             show the inventory
+  ./ontap_vol0_check.sh secrets [target] which secret will be tried per cluster
+
+Credentials are tried in order without asking: the secret named after the
+cluster (admin), then -SRE-RW, then -SRE-RO. You are only prompted once every
+one of them has been refused. Clusters whose secret is named nothing like the
+cluster go in secrets_map.txt — "./ontap_vol0_check.sh secrets" lists them as ???.
 
 Runs on every node of every selected cluster:
   $VOL0_CMD
@@ -122,7 +133,7 @@ dumps and packet traces cleared.
 Writes:
   vol0/<region>/<cluster>.txt   raw capture, per cluster
   report/vol0_by_cluster.txt    one line per cluster, tightest first — the work list
-  report/vol0_usage.csv         region,cluster,node,volume,size,available,used,available_gb,status
+  report/vol0_usage.csv         region,cluster,node,volume,size,available,used,available_gb,status,login
   report/vol0_low_space.txt     just the ALERT nodes
 
 Environment:
@@ -136,7 +147,8 @@ Environment:
   PROJECT_MAP=file  per-region projects, "region project" (default: netapp-<region>-sde)
   SECRETS_MAP=file  per-cluster secrets, "vserver secret [user]"
   SSH_USER          default cluster user            (default: admin, overridable at the prompt)
-  MAX_ATTEMPTS=n    logins to try per cluster       (default: 3)
+  MAX_SECRETS=n     credentials tried before asking (default: 4)
+  MAX_ATTEMPTS=n    prompt-and-retry rounds         (default: 3)
 USAGE
 }
 
@@ -193,48 +205,84 @@ project_for() {
   printf 'netapp-%s-sde' "$region"
 }
 
-# All secrets in the region's project whose name mentions this cluster.
-secret_candidates() {
-  local vserver="$1" region="$2"
-  command -v gcloud >/dev/null 2>&1 || return 1
-  gcloud secrets list --project "$(project_for "$region")" --format='value(name)' \
-    </dev/null 2>/dev/null | grep -i -- "$vserver"
-}
-
-# Picks the secret holding usable credentials and the username that goes with it.
-# Emits "<secret-name> <username>". Naming convention, in order of preference:
-#   <vserver>            cluster admin password        -> SSH_USER
-#   <vserver>-SRE-RW     read-write service account    -> sre-rw
-#   <vserver>-SRE-RO     read-only service account     -> sre-ro
-#   <vserver>-admin      older naming                  -> SSH_USER
-# Suffixes like -OKM-passphrase and ..._svc-backup are never credentials.
-# secrets_map.txt wins over all of it ("vserver secret [user]" per line).
-lookup_secret_name() {
-  local vserver="$1" region="$2" list chosen m_secret m_user
-
-  if [[ -f "$SECRETS_MAP" ]]; then
-    read -r m_secret m_user <<< "$(awk -v v="$vserver" '$1==v {print $2, $3; exit}' "$SECRETS_MAP")"
-    if [[ -n "$m_secret" ]]; then
-      printf '%s %s' "$m_secret" "${m_user:-$SSH_USER}"; return 0
+# Every secret in the region's project. Cached: one gcloud call per project
+# answers for all of that region's clusters instead of one call per cluster.
+project_secrets() {
+  local region="$1" proj cache
+  proj="$(project_for "$region")"
+  cache="$SECRET_CACHE/$proj"
+  if [[ ! -f "$cache" ]]; then
+    if command -v gcloud >/dev/null 2>&1; then
+      gcloud secrets list --project "$proj" --format='value(name)' \
+        </dev/null 2>/dev/null >"$cache"
+    else
+      : >"$cache"
     fi
   fi
+  cat "$cache"
+}
 
-  list="$(secret_candidates "$vserver" "$region")" || return 1
+# The ONTAP account that goes with a secret, read off its name.
+user_for_secret() {
+  case "$(lc "$1")" in
+    *sre?rw)         printf 'sre-rw' ;;
+    *sre?ro|*sre?r0) printf 'sre-ro' ;;
+    *)               printf '%s' "$SSH_USER" ;;
+  esac
+}
 
-  chosen="$(printf '%s\n' "$list" | grep -ix -- "$vserver" | head -n1)"
-  [[ -n "$chosen" ]] && { printf '%s %s' "$chosen" "$SSH_USER"; return 0; }
+# OKM passphrases, backup keys and the like sit next to the credentials and are
+# never something you can log in with.
+is_credential_secret() {
+  case "$(lc "$1")" in
+    *okm*|*passphrase*|*backup*|*cert*|*keyfile*) return 1 ;;
+  esac
+  return 0
+}
 
-  chosen="$(printf '%s\n' "$list" | grep -iE -- "^${vserver}[-_]SRE[-_]RW$" | head -n1)"
-  [[ -n "$chosen" ]] && { printf '%s %s' "$chosen" 'sre-rw'; return 0; }
+# Ordered "secret<TAB>user" candidates for a cluster, best first.
+#
+# The whole point of the list: the secret named after the cluster holds the
+# admin password, but plenty of stamps refuse that account and only accept
+# sre-rw. Rather than asking a human the moment admin is refused, every
+# plausible credential is handed over and tried in turn.
+#
+# Order: secrets_map.txt, then <cluster>, <cluster>-SRE-RW, <cluster>-SRE-RO,
+# <cluster>-admin, then anything else in the project naming this cluster.
+credential_candidates() {
+  local vserver="$1" region="$2" list
 
-  # -R0 (zero) shows up in a few names; same account as -RO
-  chosen="$(printf '%s\n' "$list" | grep -iE -- "^${vserver}[-_]SRE[-_]R[O0]$" | head -n1)"
-  [[ -n "$chosen" ]] && { printf '%s %s' "$chosen" 'sre-ro'; return 0; }
+  {
+    # The map is where clusters whose secret is named nothing like the cluster
+    # are recorded. Several lines per cluster is fine; they're tried in order.
+    if [[ -f "$SECRETS_MAP" ]]; then
+      awk -v v="$(lc "$vserver")" '
+        $1 ~ /^#/ { next }
+        tolower($1) == v && $2 != "" { print $2 "\t" $3 }
+      ' "$SECRETS_MAP"
+    fi
 
-  chosen="$(printf '%s\n' "$list" | grep -iE -- '[-_]admin$' | head -n1)"
-  [[ -n "$chosen" ]] && { printf '%s %s' "$chosen" "$SSH_USER"; return 0; }
+    list="$(project_secrets "$region" | grep -i -- "$vserver")"
+    if [[ -n "$list" ]]; then
+      printf '%s\n' "$list" | grep -ix  -- "$vserver"
+      printf '%s\n' "$list" | grep -iE -- "^${vserver}[-_]SRE[-_]RW$"
+      printf '%s\n' "$list" | grep -iE -- "^${vserver}[-_]SRE[-_]R[O0]$"
+      printf '%s\n' "$list" | grep -iE -- "^${vserver}[-_]admin$"
+      printf '%s\n' "$list"
+    fi
+  } | while IFS=$'\t' read -r s u; do
+        [[ -z "$s" ]] && continue
+        is_credential_secret "$s" || continue
+        printf '%s\t%s\n' "$s" "${u:-$(user_for_secret "$s")}"
+      done | awk -F'\t' '!seen[tolower($1)]++'
+}
 
-  return 1
+secret_password() {
+  local secret="$1" region="$2" raw
+  raw="$(gcloud secrets versions access latest --secret="$secret" \
+           --project "$(project_for "$region")" </dev/null 2>/dev/null)" || return 1
+  [[ -z "$raw" ]] && return 1
+  extract_password "$raw"
 }
 
 # Secret payloads are usually JSON like {"password":"..."}; fall back to raw text.
@@ -253,69 +301,122 @@ except Exception: pass' 2>/dev/null)"
   printf '%s' "$pw"
 }
 
-# resolve_creds <vserver> <region> [retry]
-# Sets CRED_USER / CRED_PW rather than echoing, so the username can come back too.
-# Must be called directly (not in a command substitution) or the globals are lost.
-# retry=1 skips Secret Manager (its value evidently didn't work) and prompts.
-resolve_creds() {
-  local vserver="$1" region="${2:-}" retry="${3:-0}"
-  local proj; proj="$(project_for "$region")"
-  CRED_USER="$SSH_USER"; CRED_PW=""
+# CRED_USERS / CRED_PWS are parallel: credential N is CRED_USERS[N] + CRED_PWS[N],
+# best first. Filled by gather_creds or prompt_creds, which must be called
+# directly (never in a command substitution) or the globals are lost.
+CRED_USERS=()
+CRED_PWS=()
+CRED_DESC=""
 
-  # The secret named exactly like the cluster isn't always the account that can
-  # log in — some clusters only accept sre-rw. ASK_CREDS=1 skips the lookup so
-  # you can type the one you know works.
-  [[ "${ASK_CREDS:-0}" == "1" ]] && retry=1
+# Every credential Secret Manager can offer for this cluster, up to MAX_SECRETS.
+gather_creds() {
+  local vserver="$1" region="$2" secret user pw
+  CRED_USERS=(); CRED_PWS=(); CRED_DESC=""
 
-  if [[ -n "${ONTAP_PASSWORD:-}" && "$retry" != "1" ]]; then
-    CRED_PW="$ONTAP_PASSWORD"; return 0
+  if [[ -n "${ONTAP_PASSWORD:-}" ]]; then
+    CRED_USERS=( "$SSH_USER" ); CRED_PWS=( "$ONTAP_PASSWORD" )
+    CRED_DESC="\$ONTAP_PASSWORD ($SSH_USER)"
+    return 0
   fi
 
-  local pair secret user raw="" pw=""
-  if [[ "$retry" != "1" ]] && pair="$(lookup_secret_name "$vserver" "$region")"; then
-    read -r secret user <<< "$pair"
-    raw="$(gcloud secrets versions access latest --secret="$secret" \
-             --project "$proj" </dev/null 2>/dev/null)"
-    [[ -n "$raw" ]] && pw="$(extract_password "$raw")"
-    if [[ -n "$pw" ]]; then
-      CRED_USER="${user:-$SSH_USER}"; CRED_PW="$pw"
-      printf '    %-38s <- secret %s (user %s)\n' "$vserver" "$secret" "$CRED_USER" >&2
-      return 0
-    fi
-  fi
+  while IFS=$'\t' read -r secret user; do
+    [[ -z "$secret" ]] && continue
+    (( ${#CRED_USERS[@]} >= MAX_SECRETS )) && break
+    pw="$(secret_password "$secret" "$region")" || continue
+    [[ -z "$pw" ]] && continue
+    CRED_USERS+=( "$user" ); CRED_PWS+=( "$pw" )
+    CRED_DESC+="${CRED_DESC:+, }$secret($user)"
+  done < <(credential_candidates "$vserver" "$region")
 
-  # Prompt, showing where to go find it.
-  local u=""
+  (( ${#CRED_USERS[@]} > 0 ))
+}
+
+# Which accounts a previous attempt already burned through, from its capture.
+tried_users() {
+  [[ -f "${1:-}" ]] || return 0
+  sed -n 's/^===TRIED=== //p' "$1" | awk '{ printf "%s%s", sep, $1; sep=", " }'
+}
+
+# Last resort, once every candidate has been refused.
+prompt_creds() {
+  local vserver="$1" region="$2" tried="${3:-}" proj u="" pw="" near=""
+  proj="$(project_for "$region")"
+  CRED_USERS=(); CRED_PWS=(); CRED_DESC="typed in"
+
   printf '\n    %s  [%s]\n' "$vserver" "$region" >&2
-  if [[ "$retry" == "1" ]]; then
-    printf '      previous login failed — re-enter\n' >&2
-  fi
+  [[ -n "$tried" ]] && printf '      refused : %s\n' "$tried" >&2
   printf '      project : %s\n' "$proj" >&2
   printf '      secrets : https://console.cloud.google.com/security/secret-manager?project=%s\n' "$proj" >&2
   printf '      search  : %s\n' "$vserver" >&2
+
+  # Nothing in the project is named after this cluster, so searching for it will
+  # find nothing. Show the region's credential secrets instead — the right one is
+  # in that list under some other name, and belongs in secrets_map.txt so this
+  # cluster is never asked about again.
+  if ! project_secrets "$region" | grep -qi -- "$vserver"; then
+    near="$(project_secrets "$region" | grep -iE -- '[-_](SRE[-_]R[WO0]|admin)$' | sort | head -n 25)"
+    if [[ -n "$near" ]]; then
+      printf '      no secret names this cluster. This region has:\n' >&2
+      # shellcheck disable=SC2086
+      printf '        %s\n' $near >&2
+      printf '      add the right one to %s as: %s <secret>\n' "$SECRETS_MAP" "$vserver" >&2
+    fi
+  fi
+
   printf '      username [%s]: ' "$SSH_USER" >&2
   read -r u </dev/tty
-  [[ -n "$u" ]] && CRED_USER="$u"
   printf '      password: ' >&2
-  read -rs CRED_PW </dev/tty; printf '\n' >&2
+  read -rs pw </dev/tty; printf '\n' >&2
 
-  [[ -z "$CRED_PW" ]] && return 1
+  [[ -z "$pw" ]] && return 1
+  CRED_USERS=( "${u:-$SSH_USER}" ); CRED_PWS=( "$pw" )
   return 0
+}
+
+# Fills CRED_* for one cluster: secrets first, prompt only if that comes up empty
+# (or on a retry, where the secrets have already been proven wrong).
+prepare_creds() {
+  local vserver="$1" region="$2" retry="${3:-0}" prev="${4:-}"
+
+  if [[ "$retry" == "1" || "${ASK_CREDS:-0}" == "1" ]]; then
+    prompt_creds "$vserver" "$region" "$(tried_users "$prev")"
+    return $?
+  fi
+
+  if gather_creds "$vserver" "$region"; then
+    printf '    %-38s <- %s\n' "$vserver" "$CRED_DESC" >&2
+    return 0
+  fi
+
+  prompt_creds "$vserver" "$region" ""
 }
 
 # ------------------------------------------------------------------ capture --
 
 # A capture counts only if ONTAP actually answered about vol0. An ssh error or a
 # login banner must not be mistaken for "no alert".
+#
+# ===USER=== is written only after a login succeeded, so when the markers are
+# present they are the answer — a refused attempt's error text can't be mistaken
+# for real output.
 valid_vol0() {
   [[ -s "$1" ]] || return 1
+  grep -q '^===USER===' "$1"  && return 0
+  grep -q '^===TRIED===' "$1" && return 1
   grep -qw 'vol0' "$1" || grep -qi 'no entries matching\|there are no entries' "$1"
 }
 
+# The account that finally got in.
+capture_user() { sed -n 's/^===USER=== //p' "${1:-}" 2>/dev/null | head -n1; }
+
 # Why a cluster came back unusable, in a few words, from its own output.
 vol0_failure_reason() {
-  local f="$1"
+  local f="$1" t
   [[ -s "$f" ]] || { printf 'no output'; return; }
+
+  t="$(sed -n 's/^===TRIED=== //p' "$f" | awk '{ printf "%s%s", sep, $0; sep=" | " }')"
+  [[ -n "$t" ]] && { printf '%s' "$t" | cut -c1-100; return; }
+
   if   grep -qi 'permission denied\|authentication fail\|access denied' "$f"; then printf 'bad username/password'
   elif grep -qi 'timed out\|no route to host\|refused\|unreachable'      "$f"; then printf 'unreachable'
   elif grep -qi 'not authorized\|insufficient privileges'                "$f"; then printf 'user lacks rights'
@@ -336,10 +437,28 @@ note_failure() {
 }
 
 build_vol0_block() {
-  local region="$1" vslist="$2" retry="${3:-0}" vs ip
+  local region="$1" vslist="$2" retry="${3:-0}" vs ip i args
 
   printf 'stty -echo 2>/dev/null\n'
   printf 'command -v sshpass >/dev/null 2>&1 || echo "===NOSSHPASS==="\n'
+
+  # Walks the credentials on the jumphost, so a cluster that refuses the admin
+  # secret falls through to sre-rw and sre-ro inside the same hop instead of
+  # coming back here to ask a human.
+  printf '%s\n' '__vol0_try() {
+  __ip=$1; __cmd=$2; shift 2
+  while [ $# -ge 2 ]; do
+    __u=$1; __p=$2; shift 2
+    __out=$(SSHPASS="$__p" sshpass -e ssh -n '"$SSH_OPTS_STR"' "$__u@$__ip" "$__cmd" 2>&1)
+    case "$__out" in
+      *vol0*|*"no entries"*)
+        printf "===USER=== %s\n%s\n" "$__u" "$__out"
+        return 0 ;;
+    esac
+    printf "===TRIED=== %s : %s\n" "$__u" "$(printf "%s" "$__out" | tr -d "\r" | grep -v "^[ 	]*$" | tail -n1)"
+  done
+  return 1
+}'
 
   # fd 3 so ssh/gcloud inside the loop can't swallow the cluster list
   while read -r vs <&3; do
@@ -348,12 +467,17 @@ build_vol0_block() {
     if [[ -z "$ip" ]]; then
       printf '    !! %s is not in the inventory, skipping\n' "$vs" >&2; continue
     fi
-    if ! resolve_creds "$vs" "$region" "$retry"; then
+    if ! prepare_creds "$vs" "$region" "$retry" "$VOL0DIR/$region/$vs.txt"; then
       printf '    !! no password for %s, skipping\n' "$vs" >&2; continue
     fi
+
+    args=""
+    for (( i=0; i<${#CRED_USERS[@]}; i++ )); do
+      args+=" $(shq "${CRED_USERS[i]}") $(shq "${CRED_PWS[i]}")"
+    done
+
     printf 'echo "===CLUSTER=== %s"\n' "$vs"
-    printf 'SSHPASS=%s sshpass -e ssh -n %s %s@%s %s 2>&1\n' \
-      "$(shq "$CRED_PW")" "$SSH_OPTS_STR" "$CRED_USER" "$ip" "$(shq "$VOL0_CMD")"
+    printf '__vol0_try %s %s%s\n' "$(shq "$ip")" "$(shq "$VOL0_CMD")" "$args"
   done 3<<< "$vslist"
 
   printf 'echo "===END==="\n'
@@ -383,8 +507,9 @@ split_vol0_log() {
 # Column positions are read from the table header rather than assumed: ONTAP
 # prints -fields in its own order, not the order they were asked for.
 parse_vol0() {
-  local f="$1" region="$2" cluster="$3"
-  awk -v region="$region" -v cluster="$cluster" -v min="$MIN_FREE_GB" '
+  local f="$1" region="$2" cluster="$3" login
+  login="$(capture_user "$f")"
+  awk -v region="$region" -v cluster="$cluster" -v min="$MIN_FREE_GB" -v login="${login:-}" '
     function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
     function to_gb(s,   n, u) {
       if (s !~ /^[0-9]+(\.[0-9]+)?(B|KB|MB|GB|TB|PB)$/) return -1
@@ -415,8 +540,8 @@ parse_vol0() {
       us   = ("used"      in idx && idx["used"]      <= n) ? f[idx["used"]]      : "-"
       gb   = to_gb(av)
       status = (gb < 0) ? "UNKNOWN" : (gb < min ? "ALERT" : "OK")
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n", region, cluster, node, vol, sz, av, us,
-             (gb < 0 ? "" : sprintf("%.2f", gb)), status
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", region, cluster, node, vol, sz, av, us,
+             (gb < 0 ? "" : sprintf("%.2f", gb)), status, login
     }
     { prev = line }
   ' "$f"
@@ -425,9 +550,12 @@ parse_vol0() {
 # What the run just found on one cluster, so a tight stamp is obvious on the
 # console instead of only at the end.
 show_cluster() {
-  local region="$1" vs="$2" f="$3" node sz av us gb status any=0
+  local region="$1" vs="$2" f="$3" node sz av us gb status login any=0
 
-  while IFS=, read -r _ _ node _ sz av us gb status; do
+  login="$(capture_user "$f")"
+  [[ -n "$login" ]] && printf '    %-38s logged in as %s\n' "$vs" "$login"
+
+  while IFS=, read -r _ _ node _ sz av us gb status _; do
     [[ -z "$node" ]] && continue
     any=1
     if [[ "$status" == "ALERT" ]]; then
@@ -495,7 +623,7 @@ check_direct() {
   local targets="$1"
   command -v sshpass >/dev/null 2>&1 || die "sshpass not installed. Try: sudo apt-get install -y sshpass"
 
-  local region vs ip f attempt
+  local region vs ip f attempt i out
   while read -r region vs ip <&3; do
     [[ -z "$vs" ]] && continue
     mkdir -p "$VOL0DIR/$region"
@@ -503,10 +631,24 @@ check_direct() {
     rm -f "$f"
 
     for (( attempt=1; attempt<=MAX_ATTEMPTS; attempt++ )); do
-      if ! resolve_creds "$vs" "$region" "$(( attempt > 1 ? 1 : 0 ))"; then
+      if ! prepare_creds "$vs" "$region" "$(( attempt > 1 ? 1 : 0 ))" "$f"; then
         printf '    %-38s SKIP (no password)\n' "$vs"; break
       fi
-      SSHPASS="$CRED_PW" sshpass -e ssh -n "${SSH_OPTS[@]}" "$CRED_USER@$ip" "$VOL0_CMD" >"$f" 2>&1
+
+      # Same fall-through as the jumphost path: try each credential in turn and
+      # keep the output of the one that got in.
+      : >"$f"
+      for (( i=0; i<${#CRED_USERS[@]}; i++ )); do
+        out="$(SSHPASS="${CRED_PWS[i]}" sshpass -e ssh -n "${SSH_OPTS[@]}" \
+                 "${CRED_USERS[i]}@$ip" "$VOL0_CMD" 2>&1)"
+        if grep -qw 'vol0' <<< "$out" || grep -qi 'no entries' <<< "$out"; then
+          printf '===USER=== %s\n%s\n' "${CRED_USERS[i]}" "$out" >>"$f"
+          break
+        fi
+        printf '===TRIED=== %s : %s\n' "${CRED_USERS[i]}" \
+          "$(tr -d '\r' <<< "$out" | grep -v '^[[:space:]]*$' | tail -n1)" >>"$f"
+      done
+
       valid_vol0 "$f" && break
     done
 
@@ -526,7 +668,7 @@ build_report() {
   local low="$REPORTDIR/vol0_low_space.txt"
   local per="$REPORTDIR/vol0_by_cluster.txt"
 
-  printf 'region,cluster,node,volume,size,available,used,available_gb,status\n' >"$csv"
+  printf 'region,cluster,node,volume,size,available,used,available_gb,status,login\n' >"$csv"
   local f vs region
   while IFS= read -r f <&3; do
     vs="$(basename "$f" .txt)"
@@ -548,6 +690,7 @@ build_report() {
       nodes[k]++
       if ($9 == "ALERT")   alert[k]++
       if ($9 == "UNKNOWN") unk[k]++
+      if ($10 != "")       login[k] = $10
       gb = ($8 == "" ? -1 : $8 + 0)
       if (gb >= 0 && (!(k in minv) || gb < minv[k])) { minv[k] = gb; minav[k] = $6 }
     }
@@ -556,9 +699,9 @@ build_report() {
         k = order[i]; split(k, p, "\t")
         state = (alert[k] ? sprintf("ALERT  %d node(s) under %sGB", alert[k], min) \
                : unk[k]   ? "CHECK  available not parsed" : "OK")
-        printf "%.2f\t%-8s %-38s %2d node(s)  lowest free %-10s %s\n",
+        printf "%.2f\t%-8s %-38s %2d node(s)  lowest free %-10s %-8s %s\n",
                (k in minv ? minv[k] : 999999), p[1], p[2], nodes[k],
-               (k in minav ? minav[k] : "-"), state
+               (k in minav ? minav[k] : "-"), (k in login ? login[k] : "-"), state
       }
     }
   ' "$csv" | sort -n | cut -f2- >"$per"
@@ -588,6 +731,28 @@ build_report() {
   fi
 
   printf '\n  %s\n  %s\n  %s\n' "$per" "$csv" "$low"
+}
+
+# ------------------------------------------------------------------- secrets --
+
+# What Secret Manager can offer for each cluster, in the order it will be tried.
+# Run this to find the clusters whose secret is named nothing like the cluster
+# (they come out as ???) and paste the fix into secrets_map.txt.
+show_secrets() {
+  local targets region vs ip secret user n
+  targets="$(select_targets "$@")" || exit 1
+
+  printf '%-38s %-52s %s\n' 'CLUSTER' 'SECRET' 'USER'
+  while read -r region vs ip <&3; do
+    [[ -z "$vs" ]] && continue
+    n=0
+    while IFS=$'\t' read -r secret user; do
+      [[ -z "$secret" ]] && continue
+      printf '%-38s %-52s %s\n' "$vs" "$secret" "$user"
+      n=$(( n + 1 ))
+    done < <(credential_candidates "$vs" "$region")
+    (( n == 0 )) && printf '%-38s %-52s %s\n' "$vs" '???' "nothing in $(project_for "$region") names this cluster"
+  done 3< <(printf '%s\n' "$targets")
 }
 
 # ---------------------------------------------------------------------- main --
@@ -623,6 +788,7 @@ run_check() {
 case "${1:-}" in
   report)          build_report ;;
   list)            select_clusters all ;;
+  secrets)         shift; show_secrets "${@:-all}" ;;
   -h|--help|help)  usage ;;
   check)           shift; run_check "${@:-all}" ;;   # accepted, but not needed
   "")              run_check all ;;
