@@ -3,6 +3,7 @@ project
 output/
 report/
 vol0/
+hosts/
 secrets_map.txt
 # holds secret NAMES only, no values — needed to reach the odd-named clusters
 !ontap-vol0-check/secrets_map.txt
