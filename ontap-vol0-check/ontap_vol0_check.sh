@@ -135,6 +135,20 @@ SECRET_CACHE="$(mktemp -d 2>/dev/null || printf '/tmp/vol0.%s' "$$")"
 mkdir -p "$SECRET_CACHE"
 trap 'rm -rf "$SECRET_CACHE"' EXIT
 
+# The built-in map and secrets_map.txt, merged once into one file, before any
+# cluster is touched.
+#
+# Merging it per cluster instead put a pipeline and a subshell on the hot path
+# inside build_vol0_block's loop — the loop that also assembles the command block
+# fed to login.sh. That is the one place in this script where an extra subshell
+# is not free, so the lookup below stays exactly what it was before this list was
+# brought inline: a single guarded `awk ... FILE`, reading a file, nothing else.
+SECRETS_MAP_FILE="$SECRET_CACHE/secrets_map.merged"
+{ [[ -f "$SECRETS_MAP" ]] && cat -- "$SECRETS_MAP"
+  printf '%s\n' "$SECRETS_BUILTIN"
+} </dev/null 2>/dev/null \
+  | awk '$1 !~ /^#/ && NF >= 2 && !seen[tolower($1) " " tolower($2)]++' >"$SECRETS_MAP_FILE"
+
 usage() {
   cat <<USAGE
 Usage:
@@ -284,22 +298,19 @@ is_credential_secret() {
 # A secrets_map.txt sitting next to the script adds to the built-in list rather
 # than replacing it, and is read first so its lines are tried first. Dropping one
 # new line in a file must never silently lose the entries already worked out.
-secrets_map_data() {
-  { [[ -f "$SECRETS_MAP" ]] && cat "$SECRETS_MAP"
-    printf '%s\n' "$SECRETS_BUILTIN"
-  } | awk '$1 !~ /^#/ && NF >= 2 && !seen[tolower($1) " " tolower($2)]++'
-}
-
+# Both are already merged into SECRETS_MAP_FILE at startup.
 credential_candidates() {
   local vserver="$1" region="$2" list
 
   {
     # The map is where clusters whose secret is named nothing like the cluster
     # are recorded. Several lines per cluster is fine; they're tried in order.
-    secrets_map_data | awk -v v="$(lc "$vserver")" '
-      $1 ~ /^#/ { next }
-      tolower($1) == v && $2 != "" { print $2 "\t" $3 }
-    '
+    if [[ -s "$SECRETS_MAP_FILE" ]]; then
+      awk -v v="$(lc "$vserver")" '
+        $1 ~ /^#/ { next }
+        tolower($1) == v && $2 != "" { print $2 "\t" $3 }
+      ' "$SECRETS_MAP_FILE"
+    fi
 
     list="$(project_secrets "$region" | grep -i -- "$vserver")"
     if [[ -n "$list" ]]; then
@@ -370,20 +381,39 @@ gather_creds() {
   (( ${#CRED_USERS[@]} > 0 ))
 }
 
-# Which accounts a previous attempt already burned through, from its capture.
-tried_users() {
+# What each account tried last time actually got back, one line per account.
+#
+# Keeping only the usernames ("admin, sre-rw") gives the operator nothing to act
+# on. The reason is already sitting in the capture — "admin : Permission denied"
+# says the secret is stale, "admin : Connection timed out" says the cluster is
+# unreachable and no password will help — so show it.
+tried_detail() {
   [[ -f "${1:-}" ]] || return 0
-  sed -n 's/^===TRIED=== //p' "$1" | awk '{ printf "%s%s", sep, $1; sep=", " }'
+  sed -n 's/^===TRIED=== //p' "$1"
 }
 
 # Last resort, once every candidate has been refused.
 prompt_creds() {
-  local vserver="$1" region="$2" tried="${3:-}" proj u="" pw="" near=""
+  local vserver="$1" region="$2" prev="${3:-}" proj u="" pw="" near="" line n=0
   proj="$(project_for "$region")"
   CRED_USERS=(); CRED_PWS=(); CRED_DESC="typed in"
 
   printf '\n    %s  [%s]\n' "$vserver" "$region" >&2
-  [[ -n "$tried" ]] && printf '      refused : %s\n' "$tried" >&2
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf '      refused : %s\n' "${line:0:110}" >&2
+    n=$(( n + 1 ))
+  done < <(tried_detail "$prev")
+
+  # No ===TRIED=== line means no login was even attempted — the block never ran
+  # on the jumphost, or ssh never returned. Typing another password cannot fix
+  # that, so say so instead of silently asking again.
+  if (( n == 0 )) && [[ -n "$prev" ]]; then
+    printf '      refused : nothing came back — no login was attempted.\n' >&2
+    printf '                check %s\n' "$VOL0DIR/_session_$region.log" >&2
+  fi
+
   printf '      project : %s\n' "$proj" >&2
   printf '      secrets : https://console.cloud.google.com/security/secret-manager?project=%s\n' "$proj" >&2
   printf '      search  : %s\n' "$vserver" >&2
@@ -418,7 +448,7 @@ prepare_creds() {
   local vserver="$1" region="$2" retry="${3:-0}" prev="${4:-}"
 
   if [[ "$retry" == "1" || "${ASK_CREDS:-0}" == "1" ]]; then
-    prompt_creds "$vserver" "$region" "$(tried_users "$prev")"
+    prompt_creds "$vserver" "$region" "$prev"
     return $?
   fi
 
