@@ -1,0 +1,36 @@
+---
+description: Raising a batch of Jira tickets (one per host/cluster/item) using jira-bulk
+alwaysApply: true
+---
+
+# Batch Jira tickets
+
+When the user asks for a batch of Jira tickets — one per cluster, host, region, IP or similar —
+use `jira-bulk/` in this repo. Do not write a new script.
+
+## What to do
+
+1. Read `jira-bulk/README.md` first.
+2. Create a new job directory: `cp -r jira-bulk/jobs/_template jira-bulk/jobs/<batch-name>`.
+3. Fill in `job.json`, `rows.tsv`, `summary.tmpl`, `description.tmpl` from what the user provides.
+4. Run `render` (no network) and show the user a rendered ticket before anything is created.
+5. Tell the user to run `probe` and `create --limit 1` themselves — never create in bulk unasked.
+
+## Rules that matter
+
+- **Reproduce a pasted example ticket verbatim.** If the user pastes an existing ticket as the
+  model, copy its wording, headings and field values exactly — including typos. Substitute only
+  the values that genuinely differ per row. Do not improve, restructure or add sections.
+- **Templates use `${name}`, not `{name}`.** Jira wiki markup is full of literal braces
+  (`{code}`, `{panel:...}`, `{noformat}`) and those must pass through untouched.
+- **Never hardcode a Jira custom field id.** Put the human field name in `job.json`; the tool
+  resolves ids at runtime via `probe`.
+- **Job directories are gitignored** (`jira-bulk/jobs/*`, except `_template`). Don't add them to
+  git or move their contents into tracked files.
+- `created.tsv` inside a job directory is live state mapping rows to real Jira keys. Never
+  regenerate or delete it for a batch that still exists in Jira.
+
+## Verify before claiming success
+
+Run `render` and read the output. If modifying `jira_bulk.py` while a batch already exists,
+re-render and diff against the previous output to prove ticket content did not change.

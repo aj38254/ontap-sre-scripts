@@ -1,0 +1,32 @@
+{
+  "title": "Short description of this batch",
+
+  "jira_url": "https://jira.ngage.netapp.com",
+  "project": "COPS",
+  "issuetype": "Change",
+
+  "parent": "",
+  "linktype": "Relates",
+  "epic_name": "",
+  "assignee": "me",
+
+  "rows": "rows.tsv",
+  "id_column": "id",
+  "name_column": "name",
+
+  "summary_template": "summary.tmpl",
+  "description_template": "description.tmpl",
+
+  "priority": "Medium",
+  "components": [],
+
+  "fields": {},
+
+  "date_fields": {},
+
+  "computed": {},
+
+  "vars": {},
+
+  "exclude": []
+}

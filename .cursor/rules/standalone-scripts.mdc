@@ -1,0 +1,64 @@
+---
+description: Every operational script in this repo must be one self-contained, copy-pasteable file
+alwaysApply: true
+---
+
+# Scripts must be standalone
+
+Each task folder here (`ontap-access-review-user/`, `ontap-vol0-check/`, `ontap-cred-rotation/`, …)
+holds a script the user runs on a jumphost or VM. Those machines are wiped roughly weekly, and the
+way the script gets back onto them is: **open the file, copy the whole thing, paste it into a new
+file on the VM, run it.** Nothing else comes across.
+
+So a script must run correctly when it is the only file in an empty directory.
+
+## Not allowed
+
+- Reaching into a sibling folder — no `$SCRIPT_DIR/../other-folder/...`, ever.
+- `source`-ing another script for shared functions. Duplicate the function instead; two copies that
+  drift are cheaper here than a script that won't start.
+- Requiring a sidecar data file to exist. Inventories, cluster lists, secret-name maps, region maps
+  and similar reference data belong **inside** the script, as a quoted heredoc:
+
+```bash
+read -r -d '' SECRETS_BUILTIN <<'EOF'
+cluster-name    SECRET-NAME
+EOF
+```
+
+## Allowed
+
+- An **optional** external file that adds to the built-in data. Read it on top of the heredoc, never
+  instead of it, so creating a one-line file doesn't silently discard what's baked in:
+
+```bash
+secrets_map_data() {
+  { [[ -f "$SECRETS_MAP" ]] && cat "$SECRETS_MAP"
+    printf '%s\n' "$SECRETS_BUILTIN"
+  } | awk '$1 !~ /^#/ && NF >= 2 && !seen[tolower($1) " " tolower($2)]++'
+}
+```
+
+- The user's own `login.sh` for hopping to a jumphost, and ordinary tooling (`ssh`, `sshpass`,
+  `gcloud`, `kubectl`, `psql`, `awk`, `python3`). These are environment, not repo dependencies.
+- Files the script **writes** (`report/`, `logs/`, `output/`) and genuine per-run input the user
+  supplies (a list of accounts to delete). Neither is needed for the script to start.
+
+## When adding a new script
+
+Put it in its own folder with a `README.md`. Say in the `--help` text that it is self-contained and
+list the external commands it expects.
+
+`jira-bulk/` is the deliberate exception: it is a reusable tool driven by job directories, not a
+copy-to-a-VM script.
+
+## Verify before claiming it works
+
+Copy the script alone into an empty temp directory and run it there:
+
+```bash
+rm -rf /tmp/standalone && mkdir -p /tmp/standalone && cp <script> /tmp/standalone/ \
+  && (cd /tmp/standalone && bash <script> --help)
+```
+
+`bash -n` passing is not enough — it won't catch a missing sidecar file.

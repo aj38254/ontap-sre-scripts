@@ -45,6 +45,27 @@ SSH_OPTS_STR="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Con
 # shellcheck disable=SC2206
 SSH_OPTS=( $SSH_OPTS_STR )
 
+# Clusters whose Secret Manager secret is named nothing like the cluster, so it
+# can't be found by searching for the cluster name.
+#
+#   <cluster-as-in-the-inventory>   <secret-name>   [user]
+#
+# The user is inferred from the secret name, so the third column is only needed
+# to override that. Kept inline so this script is one self-contained file; a
+# secrets_map.txt next to it (or SECRETS_MAP=path) is read on top of this list,
+# not instead of it. Generate more with `./ontap_access_review.sh secrets`.
+read -r -d '' SECRETS_BUILTIN <<'EOF'
+nl-ams-gc-sto-d001c055r059          NL-AMS-GC-STO-NL-AMS-GC-STO-D001C055R059-SRE-RW
+ca-lon-gc-sto-dmtl10cg115br105      CA-LON-GC-STO-DMTL10CG115BR105-SRE-RW
+CA-TOR-GC-STO-TR202021315R101       CA-TOR-GC-CL01-D002C21315R0101
+DC11-11305-0105-STO                 US-QAS-GC-STO-D011C11305R0105-SRE-RW
+US-AQS-GC-STO-DC1111305R0202        US-QAS-GC-STO-D011C11305R0202-SRE-RW
+us-qas-gc-sto-d11c11305r104         US-QAS-GC-STO-D011C11305R0104-SRE-RW
+us-qas-gc-sto-d11c11305r201         US-QAS-GC-STO-D011C11305R0201-SRE-RW
+los1-360-m02-01-01-sto              LOS1-360-M02-01-01-STO-SRE-RW
+us-las-gc-sto1-nap07sec06tsf09a010  US-LAS-GC-STO-D007C06TSF09AR0107-SRE-RW
+EOF
+
 # region  vserver  mgmt-ip
 read -r -d '' INVENTORY <<'EOF'
 as-se1  sg-jur-gc-sto-sg4c20440r105          192.168.9.4
@@ -192,14 +213,22 @@ secret_candidates() {
 #   <vserver>-admin      older naming                  -> SSH_USER
 # Suffixes like -OKM-passphrase and ..._svc-backup are never credentials.
 # secrets_map.txt wins over all of it ("vserver secret [user]" per line).
+
+# A secrets_map.txt sitting next to the script adds to the built-in list rather
+# than replacing it, and is read first so its lines win. Dropping one new line in
+# a file must never silently lose the entries already worked out.
+secrets_map_data() {
+  { [[ -f "$SECRETS_MAP" ]] && cat "$SECRETS_MAP"
+    printf '%s\n' "$SECRETS_BUILTIN"
+  } | awk '$1 !~ /^#/ && NF >= 2 && !seen[tolower($1) " " tolower($2)]++'
+}
+
 lookup_secret_name() {
   local vserver="$1" region="$2" list chosen m_secret m_user
 
-  if [[ -f "$SECRETS_MAP" ]]; then
-    read -r m_secret m_user <<< "$(awk -v v="$vserver" '$1==v {print $2, $3; exit}' "$SECRETS_MAP")"
-    if [[ -n "$m_secret" ]]; then
-      printf '%s %s' "$m_secret" "${m_user:-$SSH_USER}"; return 0
-    fi
+  read -r m_secret m_user <<< "$(secrets_map_data | awk -v v="$vserver" '$1==v {print $2, $3; exit}')"
+  if [[ -n "$m_secret" ]]; then
+    printf '%s %s' "$m_secret" "${m_user:-$SSH_USER}"; return 0
   fi
 
   list="$(secret_candidates "$vserver" "$region")" || return 1

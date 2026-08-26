@@ -47,6 +47,33 @@ SSH_OPTS=( $SSH_OPTS_STR )
 # row 0 stops pagination truncating a multi-node cluster.
 VOL0_CMD='set d; row 0; vol show -volume vol0 -fields used,available,size'
 
+# Clusters whose Secret Manager secret is named nothing like the cluster, so it
+# can't be found by searching for the cluster name. Without a line here the
+# script has nothing to try and has to ask.
+#
+#   <cluster-as-in-the-inventory>   <secret-name>   [user]
+#
+# The user is inferred from the secret name (-SRE-RW -> sre-rw, -SRE-RO ->
+# sre-ro, anything else -> admin), so the third column is only needed to
+# override that. Several lines for one cluster are fine — they're tried in the
+# order written, before the name-based guesses.
+#
+# Kept inline so this script is one self-contained file. A secrets_map.txt next
+# to the script (or SECRETS_MAP=path) is read on top of this list, not instead
+# of it.
+# Find more with:  ./ontap_vol0_check.sh secrets <region>     (??? = no match)
+read -r -d '' SECRETS_BUILTIN <<'EOF'
+nl-ams-gc-sto-d001c055r059          NL-AMS-GC-STO-NL-AMS-GC-STO-D001C055R059-SRE-RW
+ca-lon-gc-sto-dmtl10cg115br105      CA-LON-GC-STO-DMTL10CG115BR105-SRE-RW
+CA-TOR-GC-STO-TR202021315R101       CA-TOR-GC-CL01-D002C21315R0101
+DC11-11305-0105-STO                 US-QAS-GC-STO-D011C11305R0105-SRE-RW
+US-AQS-GC-STO-DC1111305R0202        US-QAS-GC-STO-D011C11305R0202-SRE-RW
+us-qas-gc-sto-d11c11305r104         US-QAS-GC-STO-D011C11305R0104-SRE-RW
+us-qas-gc-sto-d11c11305r201         US-QAS-GC-STO-D011C11305R0201-SRE-RW
+los1-360-m02-01-01-sto              LOS1-360-M02-01-01-STO-SRE-RW
+us-las-gc-sto1-nap07sec06tsf09a010  US-LAS-GC-STO-D007C06TSF09AR0107-SRE-RW
+EOF
+
 # region  vserver  mgmt-ip
 read -r -d '' INVENTORY <<'EOF'
 as-se1  sg-jur-gc-sto-sg4c20440r105          192.168.9.4
@@ -145,10 +172,15 @@ Environment:
   ASK_CREDS=1       always prompt for user/password (skips Secret Manager)
   GCP_PROJECT       force one project for all Secret Manager lookups
   PROJECT_MAP=file  per-region projects, "region project" (default: netapp-<region>-sde)
-  SECRETS_MAP=file  per-cluster secrets, "vserver secret [user]"
+  SECRETS_MAP=file  extra per-cluster secrets, "vserver secret [user]", added
+                    to the list built into this script
   SSH_USER          default cluster user            (default: admin, overridable at the prompt)
   MAX_SECRETS=n     credentials tried before asking (default: 4)
   MAX_ATTEMPTS=n    prompt-and-retry rounds         (default: 3)
+
+Self-contained: one file, no other script or folder needed. It needs your own
+login.sh to hop to a jumphost (or MODE=direct if you are already on one), plus
+sshpass and gcloud on that host.
 USAGE
 }
 
@@ -249,18 +281,25 @@ is_credential_secret() {
 #
 # Order: secrets_map.txt, then <cluster>, <cluster>-SRE-RW, <cluster>-SRE-RO,
 # <cluster>-admin, then anything else in the project naming this cluster.
+# A secrets_map.txt sitting next to the script adds to the built-in list rather
+# than replacing it, and is read first so its lines are tried first. Dropping one
+# new line in a file must never silently lose the entries already worked out.
+secrets_map_data() {
+  { [[ -f "$SECRETS_MAP" ]] && cat "$SECRETS_MAP"
+    printf '%s\n' "$SECRETS_BUILTIN"
+  } | awk '$1 !~ /^#/ && NF >= 2 && !seen[tolower($1) " " tolower($2)]++'
+}
+
 credential_candidates() {
   local vserver="$1" region="$2" list
 
   {
     # The map is where clusters whose secret is named nothing like the cluster
     # are recorded. Several lines per cluster is fine; they're tried in order.
-    if [[ -f "$SECRETS_MAP" ]]; then
-      awk -v v="$(lc "$vserver")" '
-        $1 ~ /^#/ { next }
-        tolower($1) == v && $2 != "" { print $2 "\t" $3 }
-      ' "$SECRETS_MAP"
-    fi
+    secrets_map_data | awk -v v="$(lc "$vserver")" '
+      $1 ~ /^#/ { next }
+      tolower($1) == v && $2 != "" { print $2 "\t" $3 }
+    '
 
     list="$(project_secrets "$region" | grep -i -- "$vserver")"
     if [[ -n "$list" ]]; then

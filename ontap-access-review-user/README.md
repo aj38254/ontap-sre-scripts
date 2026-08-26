@@ -109,6 +109,21 @@ candidate secrets it did find, so you only look up the handful that actually nee
 lines, keep the file, and `collect` uses it from then on. The `user` column is optional — leave it
 off and it falls back to `SSH_USER`.
 
+The mappings worked out so far are already inside the script, as `SECRETS_BUILTIN` — a
+`secrets_map.txt` is read *on top of* that, never instead of it, so a short file adds to the list
+rather than shrinking it. Anything you resolve permanently is worth pasting into the script too, so
+it survives being copied to a fresh VM.
+
+## Running it on a fresh VM
+
+`ontap_access_review.sh` is one self-contained file. Copy its contents into a new file on the box,
+`chmod +x`, run it — the inventory and the secret-name map are inside it, and it needs no other file
+from this repo. It does expect your own `login.sh` (or `MODE=direct` on a jumphost), plus `sshpass`
+and `gcloud` on that host, and a `users_to_remove.txt` when you get to `delete`.
+
+`ontap_verify_account.sh` is the one exception: it reuses this script's functions, so copy both
+files, side by side, if you need it.
+
 ## Removing users
 After `collect` and once the COPS change is approved. The account list lives in
 `users_to_remove.txt` — one ONTAP account name per line (that's the **GCP TVC SSO**, not the NetApp

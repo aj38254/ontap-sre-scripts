@@ -38,9 +38,33 @@ GCP_PROJECT="${GCP_PROJECT:-}"
 MODE="${MODE:-auto}"              # auto | login | direct
 NO_SECRETS="${NO_SECRETS:-0}"     # 1 = skip the Secret Manager column
 
-# Where the access review parked its `security login show` captures. Optional:
-# if it's there the survey gains a "local accounts" column, if not it's blank.
-ACCESS_OUT="${ACCESS_OUT:-$SCRIPT_DIR/../ontap-access-review-user/output}"
+# Where `security login show` captures live, for the "local accounts" column.
+# Drop captures into accounts/<region>/<cluster>.txt. Blank column if there are
+# none — it is a nice-to-have, not a prerequisite. ACCESS_OUT_ALT is a second
+# directory to look in; it is deliberately empty by default so that this script
+# never reaches into a sibling folder that may not have been copied across.
+ACCESS_OUT="${ACCESS_OUT:-$SCRIPT_DIR/accounts}"
+ACCESS_OUT_ALT="${ACCESS_OUT_ALT:-}"
+
+# Clusters whose Secret Manager secret is named nothing like the cluster, so it
+# cannot be found by searching for the cluster name.
+#
+#   <cluster-as-in-the-inventory>   <secret-name>
+#
+# Kept inline so this script is one self-contained file. A secrets_map.txt next
+# to the script (or SECRETS_MAP=path) is read on top of this list, not instead
+# of it.
+read -r -d '' SECRETS_BUILTIN <<'EOF'
+nl-ams-gc-sto-d001c055r059          NL-AMS-GC-STO-NL-AMS-GC-STO-D001C055R059-SRE-RW
+ca-lon-gc-sto-dmtl10cg115br105      CA-LON-GC-STO-DMTL10CG115BR105-SRE-RW
+CA-TOR-GC-STO-TR202021315R101       CA-TOR-GC-CL01-D002C21315R0101
+DC11-11305-0105-STO                 US-QAS-GC-STO-D011C11305R0105-SRE-RW
+US-AQS-GC-STO-DC1111305R0202        US-QAS-GC-STO-D011C11305R0202-SRE-RW
+us-qas-gc-sto-d11c11305r104         US-QAS-GC-STO-D011C11305R0104-SRE-RW
+us-qas-gc-sto-d11c11305r201         US-QAS-GC-STO-D011C11305R0201-SRE-RW
+los1-360-m02-01-01-sto              LOS1-360-M02-01-01-STO-SRE-RW
+us-las-gc-sto1-nap07sec06tsf09a010  US-LAS-GC-STO-D007C06TSF09AR0107-SRE-RW
+EOF
 
 # region  vserver  mgmt-ip
 read -r -d '' INVENTORY <<'EOF'
@@ -138,12 +162,17 @@ Writes:
 Environment:
   LOGIN_SH=path     path to your login.sh    (default: alongside this script)
   MODE=login|direct force the hop mode       (default: auto-detect)
-  ACCESS_OUT=dir    access review captures   (default: ../ontap-access-review-user/output)
+  ACCESS_OUT=dir    `security login show` captures (default: ./accounts)
   NO_SECRETS=1      skip the Secret Manager column (faster, no gcloud)
   GCP_PROJECT       force one project for all Secret Manager lookups
   PROJECT_MAP=file  per-region projects, "region project" (default: netapp-<region>-sde)
+  SECRETS_MAP=file  odd-named secrets, "cluster secret" (default: the built-in list)
 
 Read-only: it changes no password and never logs into a cluster.
+
+Self-contained: one file, no other script or folder needed. It needs your own
+login.sh to hop to a jumphost (or MODE=direct if you are already on one), and
+the usual gcloud/kubectl/psql on that host.
 USAGE
 }
 
@@ -302,14 +331,22 @@ project_secrets() {
   cat "$cache"
 }
 
+# A secrets_map.txt sitting next to the script adds to the built-in list rather
+# than replacing it, and is read first so its lines are tried first. Dropping one
+# new line in a file must never silently lose the entries already worked out.
+secrets_map_data() {
+  { [[ -f "$SECRETS_MAP" ]] && cat "$SECRETS_MAP"
+    printf '%s\n' "$SECRETS_BUILTIN"
+  } | awk '$1 !~ /^#/ && NF >= 2 && !seen[tolower($1) " " tolower($2)]++'
+}
+
 # Every secret holding a password for this cluster — these are the ones that
 # need a new version adding once the rotation is done.
 secrets_for() {
   local vserver="$1" region="$2"
   {
-    if [[ -f "$SECRETS_MAP" ]]; then
-      awk -v v="$(lc "$vserver")" '$1 !~ /^#/ && tolower($1)==v && $2!="" { print $2 }' "$SECRETS_MAP"
-    fi
+    secrets_map_data \
+      | awk -v v="$(lc "$vserver")" '$1 !~ /^#/ && tolower($1)==v && $2!="" { print $2 }'
     project_secrets "$region" | grep -i -- "$vserver"
   } | grep -viE 'okm|passphrase|backup|cert' | awk '!seen[tolower($0)]++' \
     | awk '{ printf "%s%s", sep, $0; sep=";" }'
@@ -317,18 +354,21 @@ secrets_for() {
 
 # ---------------------------------------------------------- local accounts --
 
-# Account names the access review already captured for this cluster. Only the
-# cluster vserver's own logins; the per-volume svm_* vservers just hold vsadmin.
+# Account names captured for this cluster. Scoped to the cluster's OWN vserver
+# by name, not just "not an svm_*" — a capture that scrolls past into another
+# vserver's block would otherwise credit this cluster with accounts (vsadmin,
+# most of all) that do not live on it.
 local_accounts_for() {
   local region="$1" vserver="$2" f
   f="$ACCESS_OUT/$region/$vserver.txt"
+  [[ ! -f "$f" && -n "$ACCESS_OUT_ALT" ]] && f="$ACCESS_OUT_ALT/$region/$vserver.txt"
   [[ -f "$f" ]] || return 0
-  awk '
-    /^Vserver:/              { vs=$2; indata=0; next }
+  awk -v want="$(lc "$vserver")" '
+    /^Vserver:/              { vs=tolower($2); indata=0; next }
     /^-{5,}/                 { indata=1; next }
     /^[[:space:]]*$/         { indata=0; next }
     /entries were displayed/ { indata=0; next }
-    indata && NF>=4 && vs !~ /^svm_/ { print $1 }
+    indata && NF>=4 && vs==want { print $1 }
   ' "$f" | sort -u | awk '{ printf "%s%s", sep, $0; sep=";" }'
 }
 

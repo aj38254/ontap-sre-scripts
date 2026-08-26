@@ -35,7 +35,7 @@ turn**, so a stamp that refuses the admin account falls through to `sre-rw` and 
 `sre-ro` on its own. All of that happens inside the same jumphost hop — there's no extra
 round trip and no prompt. The order is:
 
-1. anything listed for that cluster in `secrets_map.txt`
+1. anything mapped for that cluster (built into the script, plus `secrets_map.txt` if present)
 2. the secret named exactly like the cluster → `admin`
 3. `<cluster>-SRE-RW` → `sre-rw`
 4. `<cluster>-SRE-RO` (or `-SRE-R0`) → `sre-ro`
@@ -57,11 +57,15 @@ everything; `ASK_CREDS=1` skips it and always asks.
 Several stamps are in Secret Manager under a name that has nothing to do with the name in
 the inventory — `DC11-11305-0105-STO` lives under `US-QAS-GC-STO-D011C11305R0105-SRE-RW`,
 for instance. Searching for the cluster finds nothing, so there is nothing to try and the
-script has to ask. Those mappings live in `secrets_map.txt`:
+script has to ask. Those mappings are baked into the script itself, as `SECRETS_BUILTIN`:
 
 ```
 DC11-11305-0105-STO   US-QAS-GC-STO-D011C11305R0105-SRE-RW
 ```
+
+A `secrets_map.txt` next to the script is optional and is read *on top of* that list, so a
+one-line file adds a mapping instead of replacing the ones already worked out. Keeping the
+list in the script is what lets you copy the single file to a VM and have it work.
 
 The account is inferred from the secret name, so a third column is only needed to override
 it. To find any that are still missing:

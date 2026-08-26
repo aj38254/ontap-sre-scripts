@@ -4,6 +4,16 @@ output/
 report/
 vol0/
 hosts/
+# captured cluster state and rotation evidence: account names, session logs
+accounts/
+evidence/
+# Each jira-bulk job is one batch of tickets: working state, not source. The
+# starter template is the only one worth keeping in the repo.
+jira-bulk/jobs/*
+!jira-bulk/jobs/_template/
+jira-bulk/jobs/_template/tickets/
 secrets_map.txt
 # holds secret NAMES only, no values — needed to reach the odd-named clusters
 !ontap-vol0-check/secrets_map.txt
+!ontap-cred-rotation/secrets_map.txt
+__pycache__/
