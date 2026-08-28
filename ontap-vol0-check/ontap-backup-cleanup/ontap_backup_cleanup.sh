@@ -5,7 +5,7 @@
 # ONTAP keeps writing system configuration backups and never ages them out, so
 # they pile up until the node runs out of room. Until the ONTAP team ships a
 # real retention setting, this walks the fleet and removes the ones older than
-# two weeks.
+# 30 days.
 #
 # Self-contained: no other script, file or map is required. Run it from your
 # ADMIN MACHINE (the box where login.sh lives) and for each region it will:
@@ -44,9 +44,9 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 MAX_SECRETS="${MAX_SECRETS:-4}"   # credentials tried per cluster before asking
 
 # Retention. A backup is deleted only when it is STRICTLY older than this many
-# days, so a backup dated exactly two weeks ago is kept — "older than 2 weeks"
+# days, so a backup dated exactly 30 days ago is kept — "older than 30 days"
 # should never be read as "including the boundary" by a script that deletes.
-RETAIN_DAYS="${RETAIN_DAYS:-14}"
+RETAIN_DAYS="${RETAIN_DAYS:-30}"
 
 # Floor guard, applied per node AFTER the age rule: the newest MIN_KEEP backups
 # are never deleted, whatever their age. If a node's backup job has been dead
@@ -216,7 +216,10 @@ delete options:
   --execute        really run the deletes. Without it, the commands are only printed.
   --limit N        stop after N deletions this run (default: $DELETE_LIMIT_DEFAULT, 0 = no cap)
   --yes            skip the typed confirmation (for an approved, scripted run)
-  <region|cluster> restrict to part of what was collected
+  <region|cluster|node> restrict to part of what was collected. Region and cluster
+                   match in full; a node matches on any part of its name, so "nc06"
+                   is enough. Without this, --limit works down the plan in node
+                   order and may never reach the node you care about.
 
 Credentials: admin and sre-rw only. sre-ro is read-only and cannot delete, so it
 is never tried — if neither of the others works you are asked for a username and
@@ -243,7 +246,7 @@ Writes:
   report/deleted.txt                  what actually disappeared, proven by the post-check
 
 Environment:
-  RETAIN_DAYS=n     delete older than this many days   (default: 14)
+  RETAIN_DAYS=n     delete older than this many days   (default: 30)
   MIN_KEEP=n        newest per node never deleted      (default: 5)
   DELETE_BATCH=n    deletes chained per ssh            (default: 20)
   DEFAULT_REGION    where a bare run goes              (default: eu-w6)
@@ -945,14 +948,26 @@ build_report() {
 
 # -------------------------------------------------------------------- delete --
 
+# A filter token selects a row by exact region, exact cluster, or as a substring
+# of the node name. The node case is a substring because node names are long and
+# only the NCxx part distinguishes them: "nc06" is what you actually want to type.
+FILTER_AWK='
+  function row_wanted(r, c, nd,   i) {
+    if (nf == 0) return 1
+    for (i = 1; i <= nf; i++)
+      if (want[i] == r || want[i] == c || index(nd, want[i]) > 0) return 1
+    return 0
+  }
+  BEGIN { nf = split(f, a, " "); for (i = 1; i <= nf; i++) want[i] = tolower(a[i]) }
+'
+
 # "region cluster node backup" for everything the plan marks DELETE, optionally
-# narrowed to some regions/clusters and capped at a limit.
+# narrowed to some regions/clusters/nodes and capped at a limit.
 deletion_rows() {
   local filter="$1" limit="$2"
-  awk -F, -v f="$filter" -v lim="$limit" '
-    BEGIN { n = split(f, a, " "); for (i = 1; i <= n; i++) want[tolower(a[i])] = 1 }
+  awk -F, -v f="$filter" -v lim="$limit" "$FILTER_AWK"'
     NR > 1 && $9 == "DELETE" {
-      if (n > 0 && !(tolower($1) in want) && !(tolower($2) in want)) next
+      if (!row_wanted(tolower($1), tolower($2), tolower($3))) next
       if (lim > 0 && ++c > lim) exit
       print $1, $2, $3, $4
     }
@@ -1012,10 +1027,9 @@ cmd_delete() {
 
   local rows total
   rows="$(deletion_rows "$filter" "$limit")"
-  total="$(awk -F, -v f="$filter" '
-    BEGIN { n = split(f, a, " "); for (i = 1; i <= n; i++) want[tolower(a[i])] = 1 }
+  total="$(awk -F, -v f="$filter" "$FILTER_AWK"'
     NR > 1 && $9 == "DELETE" {
-      if (n > 0 && !(tolower($1) in want) && !(tolower($2) in want)) next
+      if (!row_wanted(tolower($1), tolower($2), tolower($3))) next
       c++
     }
     END { print c + 0 }' "$CSV")"
@@ -1181,7 +1195,8 @@ verify_deletes() {
   mkdir -p "$REPORTDIR"
   : >"$out"
 
-  local gone=0 left=0
+  local gone=0 left=0 keys
+  keys="$(mktemp)"
   while read -r region vs node backup; do
     [[ -z "$backup" ]] && continue
     f="$LOGDIR/post/$region/$vs.txt"
@@ -1194,9 +1209,22 @@ verify_deletes() {
       left=$(( left + 1 ))
     else
       printf 'DELETED      %-38s %s\n' "$vs" "$backup" >>"$out"
+      printf '%s,%s\n' "$node" "$backup" >>"$keys"
       gone=$(( gone + 1 ))
     fi
   done <<< "$rows"
+
+  # Take the deleted rows out of the CSV. `delete` reads the CSV, so leaving them
+  # in means the next run picks the same backups again — and the check above only
+  # asks "is it there now", so it would call them deleted a second time and the
+  # totals would count them twice.
+  if (( gone > 0 )) && [[ -s "$keys" && -f "$CSV" ]]; then
+    local pruned; pruned="$(mktemp)"
+    awk -F, 'NR == FNR { done[$1 SUBSEP $2] = 1; next }
+             FNR == 1 || !(($3 SUBSEP $4) in done)' "$keys" "$CSV" >"$pruned" \
+      && mv "$pruned" "$CSV" || rm -f "$pruned"
+  fi
+  rm -f "$keys"
 
   printf '\n%-24s %s\n' 'Confirmed deleted' "$gone"
   printf '%-24s %s\n'   'Still present'     "$left"

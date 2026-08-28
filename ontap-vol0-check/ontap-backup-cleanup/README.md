@@ -2,7 +2,7 @@
 
 ONTAP writes a `system configuration backup` every six hours and never ages them out, so nodes
 fill up. Until the ONTAP team gives us a real retention setting, this script finds the ones older
-than two weeks and removes them.
+than 30 days and removes them.
 
 One self-contained script. The 49-cluster inventory, the `login.sh` hop, the Secret Manager lookup
 and the credential prompt all live inside `ontap_backup_cleanup.sh` — copy that one file to a VM
@@ -46,7 +46,7 @@ run with no arguments follows it rather than hitting all 49 clusters.
 
 **The plan is rebuilt from every capture saved so far, not just the region you last collected.**
 Collect `eu-w6` today and `eu-w4` tomorrow and `report/delete_plan.txt` covers both, so a plain
-`delete --execute` would work through both. Name a region or a cluster to pin it down:
+`delete --execute` would work through both. Name a region, a cluster or a node to pin it down:
 
 ```bash
 ./ontap_backup_cleanup.sh delete --execute --limit 2 eu-w6
@@ -79,6 +79,41 @@ confirmation once you are happy to leave one running unattended.
 
 The big run is a one-off. Once the backlog is cleared only about four backups per node fall out of
 the window each day, so the routine run after that is small and quick.
+
+## Targeting one node
+
+`--limit` works down the plan in node order and stops, so a small limit only ever touches the first
+node with anything eligible. If that node is fine on space and the one you're worried about is
+further down the list, you'll never reach it — on eu-w6, NC02 alone had 51 eligible backups, so
+`--limit 6` could not get to NC05 or NC06 no matter how often it was run.
+
+Name the node instead. Any part of the name is enough:
+
+```bash
+./ontap_backup_cleanup.sh delete --limit 30 nc06              # dry run, that node only
+./ontap_backup_cleanup.sh delete --execute --limit 30 nc06    # for real
+```
+
+The same filter takes a region, a cluster, or several names at once. Note that `nc05 nc06` with a
+`--limit` still fills from the first node in the plan and only reaches the second once the first
+runs out — so to work on both, do them as two runs rather than one. Cross-check the node against
+`ontap_vol0_check.sh` and start with whichever has least free.
+
+## Space doesn't come back immediately
+
+Deleting a backup does not move `vol0` free space straight away, and a re-check within a minute or
+two will look like nothing happened. On eu-w6 a node that had ~1.9GB of backups deleted still read
+the same free space on the next two checks, then jumped +1.5GB on the one after.
+
+Two things make small batches hard to read:
+
+- **Reclaim lags the delete.** Give it a few minutes before drawing conclusions.
+- **`vol0` moves on its own.** Nodes with *zero* deletions drifted by 1.8GB, and one swung 9.4GB
+  between checks as core dumps and traces came and went. A handful of backups is ~2GB, which is
+  inside that noise.
+
+So delete in batches worth measuring — 30 backups is roughly 13GB — and compare before and after on
+the *same node*, not across nodes.
 
 ## What it runs on the cluster
 
@@ -126,12 +161,13 @@ CH-ZRH-NC01-D001C03R0113_backup_20260801_000003.7z       <- named after the NODE
 
 The `.8hour`/`.daily`/`.weekly` ones are ONTAP's own scheduled backups, which it already rotates by
 itself. The `ontap-configuration-*` ones are ad-hoc captures someone took by hand — on eu-w6 they're
-from January 2024 and would all be "older than 14 days", which is exactly why the pattern rule runs
+from January 2024 and would all be "older than 30 days", which is exactly why the pattern rule runs
 *before* the age rule and not after. Only the `_backup_` family is ever touched.
 
-**2. Strictly older than 14 days.** A backup dated exactly two weeks ago is *kept*. "Older than 2
-weeks" should never be read as "including the boundary" by something that deletes, so the boundary
-falls on the safe side. Change with `RETAIN_DAYS=n`.
+**2. Strictly older than 30 days.** A backup dated exactly 30 days ago is *kept*. "Older than 30
+days" should never be read as "including the boundary" by something that deletes, so the boundary
+falls on the safe side. Age is counted in whole calendar days from the timestamp in the filename,
+so the time of day never affects the decision. Change with `RETAIN_DAYS=n`.
 
 **3. Not in the newest 5 on its node.** This is a floor, applied after the age rule and regardless
 of age. If a node's backup job has been dead for a month then every backup it has is "old", and
