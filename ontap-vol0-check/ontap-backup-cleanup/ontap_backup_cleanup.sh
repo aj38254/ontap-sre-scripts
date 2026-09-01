@@ -212,6 +212,17 @@ Usage:
   ./ontap_backup_cleanup.sh list             show the inventory
   ./ontap_backup_cleanup.sh secrets [target] which secret will be tried per cluster
 
+Retention, usable on any of the above:
+  --days N         delete backups older than N days   (default: $RETAIN_DAYS)
+  --keep N         newest per node never deleted       (default: $MIN_KEEP)
+
+  ./ontap_backup_cleanup.sh --days 15            collect + plan at 15 days
+  ./ontap_backup_cleanup.sh plan --days 15       re-plan at 15 days, no logins
+  ./ontap_backup_cleanup.sh delete --days 15     dry run at 15 days
+
+  Given to delete, the plan is rebuilt at that retention first, so the two can
+  never disagree.
+
 delete options:
   --execute        really run the deletes. Without it, the commands are only printed.
   --limit N        stop after N deletions this run (default: $DELETE_LIMIT_DEFAULT, 0 = no cap)
@@ -1285,9 +1296,40 @@ run_collect() {
   fi
 }
 
+# --days and --keep are pulled out wherever they appear on the line, so they work
+# the same on a collect, a plan or a delete instead of having to come first.
+RETAIN_SET=0
+PASSTHRU=()
+while (( $# )); do
+  case "$1" in
+    --days)   shift; [[ $# -gt 0 ]] || die "--days needs a number: --days 15"
+              RETAIN_DAYS="$1"; RETAIN_SET=1 ;;
+    --days=*) RETAIN_DAYS="${1#--days=}"; RETAIN_SET=1 ;;
+    --keep)   shift; [[ $# -gt 0 ]] || die "--keep needs a number: --keep 5"
+              MIN_KEEP="$1" ;;
+    --keep=*) MIN_KEEP="${1#--keep=}" ;;
+    *)        PASSTHRU+=("$1") ;;
+  esac
+  shift
+done
+[[ "$RETAIN_DAYS" =~ ^[0-9]+$ ]] || die "--days must be a whole number, got: $RETAIN_DAYS"
+[[ "$MIN_KEEP"    =~ ^[0-9]+$ ]] || die "--keep must be a whole number, got: $MIN_KEEP"
+if (( ${#PASSTHRU[@]} )); then set -- "${PASSTHRU[@]}"; else set --; fi
+
 case "${1:-}" in
   plan|report)     build_report ;;
-  delete)          shift; cmd_delete "$@" ;;
+  delete)
+    shift
+    # The action column in the CSV was decided by whichever retention last ran, so
+    # a different --days here has to re-plan first or the delete would use the old
+    # rule. Re-planning reads the saved captures only — no logins.
+    if (( RETAIN_SET )); then
+      printf 'Re-planning at %s days (keeping the newest %s per node)...\n\n' \
+        "$RETAIN_DAYS" "$MIN_KEEP"
+      build_report >/dev/null || die "could not re-plan — run a collect first"
+    fi
+    cmd_delete "$@"
+    ;;
   list)            select_clusters all ;;
   secrets)         shift; show_secrets "${@:-all}" ;;
   -h|--help|help)  usage ;;

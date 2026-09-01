@@ -80,6 +80,36 @@ confirmation once you are happy to leave one running unattended.
 The big run is a one-off. Once the backlog is cleared only about four backups per node fall out of
 the window each day, so the routine run after that is small and quick.
 
+## Changing the retention window
+
+The default is 30 days. `--days n` overrides it, and works on any subcommand:
+
+```bash
+./ontap_backup_cleanup.sh --days 15              # collect + plan at 15 days
+./ontap_backup_cleanup.sh plan --days 15         # re-plan at 15 days, no logins
+./ontap_backup_cleanup.sh delete --days 15       # dry run at 15 days
+./ontap_backup_cleanup.sh delete --execute --days 15 --limit 10 nc06
+```
+
+`--keep n` does the same for the per-node floor, which defaults to 5.
+
+The action recorded in `report/backups_all.csv` is decided by whichever retention last ran, so
+passing `--days` to `delete` rebuilds the plan at that retention **before** selecting anything. The
+two can't disagree. Re-planning reads the saved captures only, so it costs nothing and needs no
+logins.
+
+On the eu-w6 capture the window makes a large difference, which is why it's worth deciding before
+you run rather than after:
+
+| `--days` | Eligible |
+| -------- | -------- |
+| 15       | 624      |
+| 30       | 320      |
+| 45       | 102      |
+| 60       | 16       |
+
+The old `RETAIN_DAYS=n` and `MIN_KEEP=n` environment variables still work and are equivalent.
+
 ## Targeting one node
 
 `--limit` works down the plan in node order and stops, so a small limit only ever touches the first
@@ -167,7 +197,7 @@ from January 2024 and would all be "older than 30 days", which is exactly why th
 **2. Strictly older than 30 days.** A backup dated exactly 30 days ago is *kept*. "Older than 30
 days" should never be read as "including the boundary" by something that deletes, so the boundary
 falls on the safe side. Age is counted in whole calendar days from the timestamp in the filename,
-so the time of day never affects the decision. Change with `RETAIN_DAYS=n`.
+so the time of day never affects the decision. Change with `--days n`.
 
 **3. Not in the newest 5 on its node.** This is a floor, applied after the age rule and regardless
 of age. If a node's backup job has been dead for a month then every backup it has is "old", and
