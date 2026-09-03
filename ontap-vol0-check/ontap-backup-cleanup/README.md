@@ -47,6 +47,7 @@ run with no arguments follows it rather than hitting all 49 clusters.
 **The plan is rebuilt from every capture saved so far, not just the region you last collected.**
 Collect `eu-w6` today and `eu-w4` tomorrow and `report/delete_plan.txt` covers both, so a plain
 `delete --execute` would work through both. Name a region, a cluster or a node to pin it down:
+`all` is also accepted and means the whole plan, same as naming nothing.
 
 ```bash
 ./ontap_backup_cleanup.sh delete --execute --limit 2 eu-w6

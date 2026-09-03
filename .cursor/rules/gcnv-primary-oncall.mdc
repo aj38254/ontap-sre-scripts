@@ -1,0 +1,14 @@
+---
+description: GCNV primary on-call — who to page, NFSAAS vs Buganizer, InvalidK8sVersion, Flex/SO SDS, CCFE 13 INTERNAL, SLO burns
+alwaysApply: true
+---
+
+# GCNV primary on-call
+
+When the user is triaging GCNV on-call (SLO, Flex/SO/PO pool create, SDS, who to page, NFSAAS, Buganizer, InvalidK8sVersion, or similar):
+
+1. Read `gcnv-primary-oncall/README.md` first. Follow it; do not re-derive ownership from memory.
+2. Tickets go in **NFSAAS** (ngage). Do not open a new Buganizer unless asked. Exception: CCFE `13 INTERNAL` — Google PIT, comment on an open same-method bug if it exists.
+3. Page **Engineering SO Primary** for Flex/SO SDS pin issues; **PO** and **VCP** are different rotations. CCFE-generated INTERNAL UUIDs (empty SDE logs) → **Google on-call**, not SO/PO/VCP.
+4. Same error + different region = new NFSAAS + Relates. Do not dump onto the wrong ticket. Do not mix `VerifyKmsConfig` quota (`netapp-pa.googleapis.com`) into the INTERNAL bug.
+5. When a new on-call pattern is settled, add it to that README (who to page + short playbook).

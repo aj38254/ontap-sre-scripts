@@ -962,9 +962,14 @@ build_report() {
 # A filter token selects a row by exact region, exact cluster, or as a substring
 # of the node name. The node case is a substring because node names are long and
 # only the NCxx part distinguishes them: "nc06" is what you actually want to type.
+#
+# "all" means the whole plan. It is a target for collect, so it gets typed at
+# delete too — and without this it would match no cluster and report "nothing
+# marked DELETE", which reads exactly like "there is nothing left to do".
 FILTER_AWK='
   function row_wanted(r, c, nd,   i) {
     if (nf == 0) return 1
+    for (i = 1; i <= nf; i++) if (want[i] == "all") return 1
     for (i = 1; i <= nf; i++)
       if (want[i] == r || want[i] == c || index(nd, want[i]) > 0) return 1
     return 0
@@ -1035,6 +1040,25 @@ cmd_delete() {
   [[ "$limit" =~ ^[0-9]+$ ]] || die "--limit must be a number, got: $limit"
 
   [[ -f "$CSV" ]] || die "no plan yet — run ./ontap_backup_cleanup.sh $DEFAULT_REGION first"
+
+  # A filter word that names nothing is almost always a mistyped flag — "--yes"
+  # entered as "yes" lands here. Left alone it silently narrows the plan to zero
+  # and prints "Nothing marked DELETE", which reads like the work is done when in
+  # fact nothing was attempted. Refuse the run instead.
+  local bad
+  bad="$(awk -F, -v f="$filter" '
+    BEGIN { nf = split(f, a, " "); for (i = 1; i <= nf; i++) want[i] = tolower(a[i]) }
+    NR > 1 { seen[tolower($1)] = 1; seen[tolower($2)] = 1; nodes[tolower($3)] = 1 }
+    END {
+      for (i = 1; i <= nf; i++) {
+        if (want[i] == "all" || want[i] in seen) continue
+        for (n in nodes) if (index(n, want[i]) > 0) { hit = 1; break }
+        if (!hit) printf "%s ", a[i]
+        hit = 0
+      }
+    }' "$CSV")"
+  [[ -z "$bad" ]] || die "not a region, cluster or node in the plan: ${bad% }
+       (if you meant the flag, it is --yes / --limit / --days / --keep)"
 
   local rows total
   rows="$(deletion_rows "$filter" "$limit")"
